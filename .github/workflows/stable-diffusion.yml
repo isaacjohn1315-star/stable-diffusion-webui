@@ -1,0 +1,123 @@
+
+name: Stable Diffusion WebUI with ngrok
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stable-diffusion-webui
+  cancel-in-progress: false
+
+jobs:
+  launch:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git python3 python3-venv python3-pip \
+            wget curl libgl1 libglib2.0-0
+
+      - name: Clone AUTOMATIC1111
+        run: |
+          git clone --depth 1 \
+            https://github.com/AUTOMATIC1111/stable-diffusion-webui.git
+          cd stable-diffusion-webui
+          git submodule update --init --recursive
+
+      - name: Download ngrok
+        run: |
+          curl -sSL \
+            https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com \
+            buster main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update
+          sudo apt-get install -y ngrok
+
+      - name: Configure ngrok
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          test -n "$NGROK_AUTHTOKEN" || {
+            echo "Missing NGROK_AUTHTOKEN secret"
+            exit 1
+          }
+          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+
+      - name: Start Stable Diffusion WebUI
+        env:
+          COMMANDLINE_ARGS: >-
+            --listen
+            --port 7860
+            --use-cpu all
+            --precision full
+            --no-half
+            --skip-torch-cuda-test
+            --api
+            --no-download-sd-model
+        run: |
+          cd stable-diffusion-webui
+          export COMMANDLINE_ARGS
+          export PYTHONUNBUFFERED=1
+          nohup bash webui.sh > ../webui.log 2>&1 &
+          echo $! > ../webui.pid
+
+      - name: Wait for WebUI
+        run: |
+          for i in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:7860/ >/dev/null; then
+              echo "WebUI is responding"
+              exit 0
+            fi
+            if ! kill -0 "$(cat webui.pid)" 2>/dev/null; then
+              cat webui.log
+              exit 1
+            fi
+            sleep 10
+          done
+          cat webui.log
+          echo "WebUI did not start in time"
+          exit 1
+
+      - name: Start ngrok tunnel
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          nohup ngrok http 7860 \
+            --log stdout > ngrok.log 2>&1 &
+          for i in $(seq 1 30); do
+            URL=$(curl -fsS http://127.0.0.1:4040/api/tunnels \
+              | python3 -c \
+              'import json,sys; d=json.load(sys.stdin); print(next((t["public_url"] for t in d["tunnels"] if t["public_url"].startswith("https://")), ""))' \
+              2>/dev/null || true)
+            if [ -n "$URL" ]; then
+              echo "===================================="
+              echo "Stable Diffusion URL: $URL"
+              echo "===================================="
+              break
+            fi
+            sleep 2
+          done
+          test -n "${URL:-}" || {
+            cat ngrok.log
+            exit 1
+          }
+
+      - name: Keep session alive
+        run: |
+          echo "Session will remain active until timeout or cancellation."
+          while true; do
+            if ! kill -0 "$(cat webui.pid)" 2>/dev/null; then
+              cat webui.log
+              exit 1
+            fi
+            sleep 30
+          done
