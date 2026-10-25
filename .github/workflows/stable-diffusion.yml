@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -34,8 +34,10 @@ jobs:
         run: |
           curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
             | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+
           echo "deb https://ngrok-agent.s3.amazonaws.com buster main" \
             | sudo tee /etc/apt/sources.list.d/ngrok.list
+
           sudo apt-get update
           sudo apt-get install -y ngrok
 
@@ -43,32 +45,35 @@ jobs:
         env:
           NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
-          test -n "$NGROK_AUTHTOKEN" || {
+          if [ -z "$NGROK_AUTHTOKEN" ]; then
             echo "Missing NGROK_AUTHTOKEN secret"
             exit 1
-          }
+          fi
+
           ngrok config add-authtoken "$NGROK_AUTHTOKEN"
 
-      - name: Configure Python packaging
-        working-directory: stable-diffusion-webui
+      - name: Fix Python build dependencies
         run: |
-          cat > pip-constraints.txt <<'EOF'
+          cat > "$GITHUB_WORKSPACE/build-constraints.txt" <<'EOF'
           setuptools==69.5.1
-          wheel<0.45
           EOF
 
-          echo "PIP_CONSTRAINT=$GITHUB_WORKSPACE/stable-diffusion-webui/pip-constraints.txt" \
+          echo "PIP_BUILD_CONSTRAINT=$GITHUB_WORKSPACE/build-constraints.txt" \
             >> "$GITHUB_ENV"
+
+          echo "Build constraint configured:"
+          cat "$GITHUB_WORKSPACE/build-constraints.txt"
 
       - name: Configure CPU-only WebUI
         working-directory: stable-diffusion-webui
         run: |
           cat > webui-user.sh <<'EOF'
           #!/usr/bin/env bash
-          export TORCH_COMMAND="pip install torch==2.1.2 torchvision==0.16.2"
+          export TORCH_COMMAND="pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cpu"
           export COMMANDLINE_ARGS="--listen --port 7860 --use-cpu all --precision full --no-half --skip-torch-cuda-test --no-download-sd-model"
           export NO_TCMALLOC=1
           EOF
+
           chmod +x webui-user.sh
 
       - name: Start Stable Diffusion WebUI
@@ -86,10 +91,11 @@ jobs:
             fi
 
             if ! kill -0 "$(cat webui.pid)" 2>/dev/null; then
-              echo "WebUI exited during startup"
+              echo "WebUI exited unexpectedly"
               tail -n 150 webui.log
               exit 1
             fi
+
             sleep 10
           done
 
@@ -101,41 +107,54 @@ jobs:
         run: |
           nohup ngrok http 7860 --log stdout > ngrok.log 2>&1 &
 
+          URL=""
+
           for i in $(seq 1 30); do
-            URL=$(curl -fsS http://127.0.0.1:4040/api/tunnels \
+            URL=$(curl -fsS \
+              http://127.0.0.1:4040/api/tunnels 2>/dev/null \
               | python3 -c \
               'import json,sys; d=json.load(sys.stdin); print(next((t["public_url"] for t in d["tunnels"] if t["public_url"].startswith("https://")), ""))' \
               2>/dev/null || true)
 
             if [ -n "$URL" ]; then
+              echo "=================================="
               echo "Stable Diffusion URL: $URL"
+              echo "=================================="
               break
             fi
+
             sleep 2
           done
 
-          if [ -z "${URL:-}" ]; then
+          if [ -z "$URL" ]; then
+            echo "Could not obtain ngrok URL"
             cat ngrok.log
             exit 1
           fi
 
       - name: Keep session alive
         run: |
+          echo "WebUI is running. Cancel the job to stop it."
+
           while true; do
             if ! kill -0 "$(cat webui.pid)" 2>/dev/null; then
-              echo "WebUI stopped"
+              echo "WebUI stopped unexpectedly"
               tail -n 150 webui.log
               exit 1
             fi
+
             sleep 30
           done
 
       - name: Print logs on failure
         if: failure()
         run: |
+          echo "===== WebUI log ====="
           if [ -f webui.log ]; then
             tail -n 200 webui.log
           fi
+
+          echo "===== ngrok log ====="
           if [ -f ngrok.log ]; then
             tail -n 100 ngrok.log
           fi
